@@ -5,8 +5,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import AsyncOpenAI
 
-# ========== НАСТРОЙКИ ==========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# ========== ТОКЕН TELEGRAM (ВСТАВЛЕН) ==========
+TELEGRAM_TOKEN = "8675727255:AAE9pArRXLlbiFGH2YTo-TZlh7DJBO_MLis"
+
+# ========== КЛЮЧ OPENAI (БЕРЁТСЯ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ) ==========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
