@@ -24,6 +24,23 @@ if not OPENAI_API_KEY:
 
 GPT_MODEL = "gpt-4o-mini"
 
+# ================== ХРАНЕНИЕ ИСТОРИИ ДИАЛОГА ==================
+user_history = {}          # user_id -> список сообщений (роль, текст)
+MAX_HISTORY = 10            # хранить последние 10 сообщений (примерно 5 пар)
+
+def get_history(user_id: int):
+    """Возвращает историю пользователя (список словарей с ролью и содержимым)"""
+    return user_history.get(user_id, [])
+
+def add_to_history(user_id: int, role: str, content: str):
+    """Добавляет сообщение в историю и обрезает её до MAX_HISTORY"""
+    if user_id not in user_history:
+        user_history[user_id] = []
+    user_history[user_id].append({"role": role, "content": content})
+    # Ограничиваем длину истории (удаляем самые старые сообщения)
+    if len(user_history[user_id]) > MAX_HISTORY:
+        user_history[user_id] = user_history[user_id][-MAX_HISTORY:]
+
 # ================== ТВОЙ ПОЛНЫЙ ПРОМПТ ==================
 
 SYSTEM_PROMPT = """
@@ -78,27 +95,51 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ================== START ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # Очищаем историю при новом старте (пользователь начинает с нуля)
+    if user_id in user_history:
+        del user_history[user_id]
     await update.message.reply_text(
         "Привет! 👋 Отправь задачу текстом или фото — разберём её вместе."
     )
 
 
+# ================== ОЧИСТКА ИСТОРИИ (КОМАНДА /CLEAR) ==================
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in user_history:
+        del user_history[user_id]
+        await update.message.reply_text("🧹 История диалога очищена. Начинаем с чистого листа.")
+    else:
+        await update.message.reply_text("История и так пуста.")
+
+
 # ================== ОБРАБОТКА ТЕКСТА ==================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     user_message = update.message.text
+
+    # Получаем историю пользователя
+    history = get_history(user_id)
+
+    # Формируем список сообщений для OpenAI: системный промпт + история + текущее сообщение
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_message}]
 
     try:
         response = await client.chat.completions.create(
             model=GPT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+            messages=messages,
             max_tokens=1500,
         )
 
         answer = response.choices[0].message.content
+
+        # Добавляем текущий вопрос и ответ в историю
+        add_to_history(user_id, "user", user_message)
+        add_to_history(user_id, "assistant", answer)
+
         await update.message.reply_text(answer)
 
     except Exception as e:
@@ -109,6 +150,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ОБРАБОТКА ФОТО ==================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
     try:
         await update.message.chat.send_action("typing")
 
@@ -119,27 +162,38 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
         user_message = update.message.caption or "Объясни задачу на фото."
 
+        # Получаем историю
+        history = get_history(user_id)
+
+        # Для фото историю учитываем, но само изображение не храним в истории.
+        # Текущее сообщение с фото отправляем как есть, история добавляется текстом.
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_message},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        },
+                    },
+                ],
+            }
+        ]
+
         response = await client.chat.completions.create(
             model=GPT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_message},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            },
-                        },
-                    ],
-                },
-            ],
+            messages=messages,
             max_tokens=1500,
         )
 
         answer = response.choices[0].message.content
+
+        # Сохраняем в историю текстовую часть (вопрос и ответ)
+        add_to_history(user_id, "user", user_message)      # сохраняем только текст, не фото
+        add_to_history(user_id, "assistant", answer)
+
         await update.message.reply_text(answer)
 
     except Exception as e:
@@ -153,6 +207,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_history))   # новая команда
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
