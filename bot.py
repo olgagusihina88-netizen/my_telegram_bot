@@ -73,46 +73,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-# ================== ПАМЯТЬ ДИАЛОГА ==================
 
-user_dialogs = {}
 
 # ================== START ==================
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_message = update.message.text
-
-    # если у пользователя нет истории — создаём
-    if user_id not in user_dialogs:
-        user_dialogs[user_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
-
-    # добавляем сообщение пользователя в историю
-    user_dialogs[user_id].append(
-        {"role": "user", "content": user_message}
-    )
-
-    try:
-        response = await client.chat.completions.create(
-            model=GPT_MODEL,
-            messages=user_dialogs[user_id],
-            max_tokens=1500,
-        )
-
-        answer = response.choices[0].message.content
-
-        # добавляем ответ бота в историю
-        user_dialogs[user_id].append(
-            {"role": "assistant", "content": answer}
-        )
-
-        await update.message.reply_text(answer)
-
-    except Exception as e:
-        logger.error(f"Ошибка OpenAI: {e}")
-        await update.message.reply_text("❌ Ошибка при обработке запроса.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! 👋 Отправь задачу текстом или фото — разберём её вместе."
     )
