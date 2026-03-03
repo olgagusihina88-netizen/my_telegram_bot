@@ -2,23 +2,17 @@ import os
 import logging
 import base64
 import re
+import json
 from datetime import datetime, timedelta
-from typing import Dict, Optional
-
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
-    ConversationHandler,
 )
 from openai import AsyncOpenAI
-
-# Google Sheets
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 
 # ================== ПЕРЕМЕННЫЕ ==================
 
@@ -28,13 +22,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # ⚠️ ВАЖНО: Укажите свой ID администратора (узнать можно у @userinfobot)
 ADMIN_ID = 1346576296  # ✅ ваш ID
 
-# Путь к JSON-ключу сервисного аккаунта (можно положить в корень проекта)
-GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "credentials.json")
-# ID вашей Google Sheets (можно взять из URL)
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "your_spreadsheet_id")
-# Имя листа (по умолчанию "users")
-SHEET_NAME = os.getenv("SHEET_NAME", "users")
-
 if not TELEGRAM_TOKEN:
     raise ValueError("Не найден TELEGRAM_TOKEN")
 if not OPENAI_API_KEY:
@@ -43,7 +30,7 @@ if not OPENAI_API_KEY:
 GPT_MODEL = "gpt-4o-mini"
 
 # ================== ХРАНЕНИЕ ИСТОРИИ ДИАЛОГА ==================
-user_history: Dict[int, list] = {}
+user_history = {}
 MAX_HISTORY = 20
 
 def get_history(user_id: int):
@@ -56,101 +43,61 @@ def add_to_history(user_id: int, role: str, content: str):
     if len(user_history[user_id]) > MAX_HISTORY:
         user_history[user_id] = user_history[user_id][-MAX_HISTORY:]
 
-# ================== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ==================
+# ================== СТАТИСТИКА ==================
+STATS_FILE = "bot_stats.json"
 
-def init_google_sheets():
-    """Подключается к Google Sheets и возвращает объект листа."""
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_SHEETS_CREDENTIALS, scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
-    return sheet
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {
+        "users": {},
+        "total_messages": 0,
+        "total_users": 0,
+    }
 
-def load_users_from_sheet():
-    """
-    Загружает всех пользователей из таблицы.
-    Ожидаемая структура таблицы (первая строка — заголовки):
-    | username | phone       | first_seen              | trial_expires           | paid |
-    """
-    sheet = init_google_sheets()
-    records = sheet.get_all_records()
-    users_by_username = {}
-    users_by_phone = {}
-    for row in records:
-        username = row.get("username", "").strip().lower()
-        phone = row.get("phone", "").strip()
-        if username:
-            users_by_username[username] = {
-                "phone": phone,
-                "first_seen": row.get("first_seen"),
-                "trial_expires": row.get("trial_expires"),
-                "paid": str(row.get("paid", "")).upper() == "TRUE"
-            }
-        if phone:
-            users_by_phone[phone] = {
-                "username": username,
-                "first_seen": row.get("first_seen"),
-                "trial_expires": row.get("trial_expires"),
-                "paid": str(row.get("paid", "")).upper() == "TRUE"
-            }
-    return users_by_username, users_by_phone
+def save_stats(stats):
+    with open(STATS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
 
-def add_user_to_sheet(username: str = None, phone: str = None):
-    """Добавляет нового пользователя в таблицу с текущей датой первого входа и временем истечения пробного периода (+12 часов)."""
-    now = datetime.now()
-    expires = now + timedelta(hours=12)
-    sheet = init_google_sheets()
-    next_row = len(sheet.get_all_values()) + 1
-    sheet.update(f"A{next_row}:E{next_row}", [[
-        username or "",
-        phone or "",
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-        expires.strftime("%Y-%m-%d %H:%M:%S"),
-        "FALSE"
-    ]])
+def update_user_stats(user_id, username, first_name):
+    stats = load_stats()
+    user_id_str = str(user_id)
+    now = datetime.now().isoformat()
 
-def update_user_paid(identifier: str, by_username: bool = True):
-    """Отмечает пользователя как оплатившего (ставит TRUE в колонке paid). Идентификатор может быть username или телефон."""
-    sheet = init_google_sheets()
-    col = 1 if by_username else 2  # колонка A для username, B для телефона
-    cells = sheet.findall(identifier)
-    for cell in cells:
-        if cell.col == col:
-            sheet.update_cell(cell.row, 5, "TRUE")  # колонка E — paid
-            return
-
-def check_user_access(identifier: str, by_username: bool = True) -> bool:
-    """
-    Проверяет, есть ли у пользователя доступ.
-    identifier: username (by_username=True) или номер телефона (by_username=False).
-    Возвращает True, если:
-    - пользователь оплатил (paid = TRUE), ИЛИ
-    - пробный период ещё не истёк (trial_expires > now)
-    """
-    users_by_username, users_by_phone = load_users_from_sheet()
-    user = None
-    if by_username:
-        user = users_by_username.get(identifier.lower())
+    if user_id_str not in stats["users"]:
+        stats["users"][user_id_str] = {
+            "username": username,
+            "first_name": first_name,
+            "first_seen": now,
+            "messages_count": 0,
+            "last_seen": now
+        }
+        stats["total_users"] = len(stats["users"])
     else:
-        user = users_by_phone.get(identifier)
-    if not user:
-        # Новый пользователь — добавляем в таблицу и даём доступ
-        if by_username:
-            add_user_to_sheet(username=identifier)
-        else:
-            add_user_to_sheet(phone=identifier)
-        return True
-    if user.get("paid"):
-        return True
-    expires_str = user.get("trial_expires")
-    if expires_str:
-        try:
-            expires = datetime.strptime(expires_str, "%Y-%m-%d %H:%M:%S")
-            if datetime.now() < expires:
-                return True
-        except:
-            pass
-    return False
+        stats["users"][user_id_str]["last_seen"] = now
+        stats["users"][user_id_str]["messages_count"] += 1
+
+    stats["total_messages"] += 1
+    save_stats(stats)
+
+def get_user_stats():
+    stats = load_stats()
+    users = stats["users"]
+    now = datetime.now()
+    today = now.date().isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    active_today = sum(1 for u in users.values() if u["last_seen"].startswith(today))
+    active_week = sum(1 for u in users.values() if u["last_seen"] > week_ago)
+
+    return {
+        "total_users": stats["total_users"],
+        "total_messages": stats["total_messages"],
+        "active_today": active_today,
+        "active_week": active_week,
+        "users": users
+    }
 
 # ================== ПРОМПТ ==================
 
@@ -202,85 +149,21 @@ def clean_latex(text: str) -> str:
     return text
 
 
-# ================== СОСТОЯНИЯ ДЛЯ ДИАЛОГА ==================
-ASK_PHONE = 1
+# ================== START ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    username = user.username
-    if username:
-        # Есть username — проверяем доступ сразу
-        if check_user_access(username, by_username=True):
-            await update.message.reply_text(
-                "Привет! 👋 У вас есть доступ. Просто отправьте мне пример или фото задания, и мы вместе его решим."
-            )
-        else:
-            await update.message.reply_text(
-                "🔒 Ваш пробный период (12 часов) истёк.\n"
-                "Для получения полного доступа обратитесь к администратору: @ваш_контакт"
-            )
-        return ConversationHandler.END
+    update_user_stats(user.id, user.username, user.first_name)
 
-    # Нет username — просим поделиться номером телефона
-    contact_keyboard = KeyboardButton("📱 Отправить номер телефона", request_contact=True)
-    reply_markup = ReplyKeyboardMarkup([[contact_keyboard]], one_time_keyboard=True, resize_keyboard=True)
+    if user.id in user_history:
+        del user_history[user.id]
+
     await update.message.reply_text(
-        "Чтобы я мог вас идентифицировать, пожалуйста, поделитесь своим номером телефона.\n"
-        "Это займёт всего секунду.",
-        reply_markup=reply_markup
+        "Привет! 👋 Я помогу тебе разобраться с задачами. Просто отправь мне пример или фото задания, и мы вместе его решим."
     )
-    return ASK_PHONE
-
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    if not contact:
-        # Если пользователь нажал отмену или отправил что-то другое
-        await update.message.reply_text("Вы не отправили номер. Для доступа к боту необходимо поделиться номером.")
-        return ConversationHandler.END
-
-    phone = contact.phone_number
-    # Проверяем доступ по номеру телефона
-    if check_user_access(phone, by_username=False):
-        await update.message.reply_text(
-            "✅ Спасибо! Ваш номер сохранён. Теперь у вас есть доступ. Отправляйте задания.",
-            reply_markup=None
-        )
-    else:
-        await update.message.reply_text(
-            "🔒 Ваш пробный период (12 часов) истёк.\n"
-            "Для получения полного доступа обратитесь к администратору: @ваш_контакт",
-            reply_markup=None
-        )
-    return ConversationHandler.END
-
-# ================== КОМАНДА ДЛЯ АДМИНА: ПОМЕТИТЬ ПОЛЬЗОВАТЕЛЯ КАК ОПЛАТИВШЕГО ==================
-
-async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Использование: /pay @username или /pay +71234567890"""
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Укажите username или номер телефона пользователя, например: /pay @ivanov  или /pay +71234567890")
-        return
-
-    target = context.args[0].strip()
-    if target.startswith('@'):
-        # это username
-        target = target[1:].lower()
-        update_user_paid(target, by_username=True)
-        await update.message.reply_text(f"✅ Пользователь @{target} отмечен как оплативший. Доступ открыт.")
-    elif target.startswith('+'):
-        # это номер телефона
-        update_user_paid(target, by_username=False)
-        await update.message.reply_text(f"✅ Пользователь с номером {target} отмечен как оплативший. Доступ открыт.")
-    else:
-        await update.message.reply_text("Неверный формат. Укажите username (с @) или номер телефона (с +).")
 
 
-# ================== СТАТИСТИКА (ТОЛЬКО ДЛЯ АДМИНА) ==================
+# ================== КОМАНДА СТАТИСТИКИ (ТОЛЬКО ДЛЯ АДМИНА) ==================
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -288,17 +171,26 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ У вас нет доступа к этой команде.")
         return
 
-    users_by_username, users_by_phone = load_users_from_sheet()
-    total = len(users_by_username) + len(users_by_phone)  # могут быть пересечения, но для простоты
-    paid = sum(1 for u in list(users_by_username.values()) + list(users_by_phone.values()) if u.get("paid"))
-    trial = total - paid
+    stats = get_user_stats()
 
     msg = (
         f"📊 **Статистика бота**\n\n"
-        f"👥 Всего пользователей в таблице: {total}\n"
-        f"💳 Оплатили: {paid}\n"
-        f"⏳ На пробном периоде: {trial}\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"💬 Всего сообщений: {stats['total_messages']}\n"
+        f"📅 Активных сегодня: {stats['active_today']}\n"
+        f"📆 Активных за неделю: {stats['active_week']}\n\n"
+        f"**Топ-5 активных пользователей:**\n"
     )
+
+    top_users = sorted(
+        stats["users"].items(),
+        key=lambda x: x[1]["messages_count"],
+        reverse=True
+    )[:5]
+
+    for user_id_str, data in top_users:
+        name = data["first_name"] or data["username"] or "Unknown"
+        msg += f"• {name}: {data['messages_count']} сообщ.\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -307,50 +199,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    username = user.username
-    # Пытаемся идентифицировать пользователя: сначала по username, потом по номеру (если сохранили ранее в context)
-    # Для простоты будем проверять оба варианта
-    users_by_username, users_by_phone = load_users_from_sheet()
+    update_user_stats(user.id, user.username, user.first_name)
+
     user_id = user.id
-
-    # Проверяем доступ по username, если есть
-    if username:
-        if check_user_access(username, by_username=True):
-            # доступ есть
-            pass
-        else:
-            await update.message.reply_text(
-                "🔒 Ваш пробный период (12 часов) истёк.\n"
-                "Для получения полного доступа обратитесь к администратору: @ваш_контакт"
-            )
-            return
-    else:
-        # нет username — нужно искать по телефону, который мог быть сохранён ранее
-        # В context мы не сохраняем телефон, поэтому придётся искать по всем записям
-        # Можно хранить в context.user_data phone после того как пользователь поделился
-        phone = context.user_data.get('phone')
-        if phone:
-            if check_user_access(phone, by_username=False):
-                # доступ есть
-                pass
-            else:
-                await update.message.reply_text(
-                    "🔒 Ваш пробный период (12 часов) истёк.\n"
-                    "Для получения полного доступа обратитесь к администратору: @ваш_контакт"
-                )
-                return
-        else:
-            # Пользователь без username и без сохранённого номера — просим поделиться номером
-            contact_keyboard = KeyboardButton("📱 Отправить номер телефона", request_contact=True)
-            reply_markup = ReplyKeyboardMarkup([[contact_keyboard]], one_time_keyboard=True, resize_keyboard=True)
-            await update.message.reply_text(
-                "Чтобы я мог вас идентифицировать, пожалуйста, поделитесь своим номером телефона.",
-                reply_markup=reply_markup
-            )
-            # Здесь нужно перейти в состояние ASK_PHONE, но мы не в диалоге, поэтому просто выходим
-            return
-
-    # Если доступ есть, обрабатываем сообщение
     user_message = update.message.text
     history = get_history(user_id)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_message}]
@@ -378,34 +229,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    username = user.username
-    user_id = user.id
+    update_user_stats(user.id, user.username, user.first_name)
 
-    # Аналогичная проверка доступа, как в handle_text
-    if username:
-        if not check_user_access(username, by_username=True):
-            await update.message.reply_text(
-                "🔒 Ваш пробный период (12 часов) истёк.\n"
-                "Для получения полного доступа обратитесь к администратору: @ваш_контакт"
-            )
-            return
-    else:
-        phone = context.user_data.get('phone')
-        if phone:
-            if not check_user_access(phone, by_username=False):
-                await update.message.reply_text(
-                    "🔒 Ваш пробный период (12 часов) истёк.\n"
-                    "Для получения полного доступа обратитесь к администратору: @ваш_контакт"
-                )
-                return
-        else:
-            contact_keyboard = KeyboardButton("📱 Отправить номер телефона", request_contact=True)
-            reply_markup = ReplyKeyboardMarkup([[contact_keyboard]], one_time_keyboard=True, resize_keyboard=True)
-            await update.message.reply_text(
-                "Чтобы я мог вас идентифицировать, пожалуйста, поделитесь своим номером телефона.",
-                reply_markup=reply_markup
-            )
-            return
+    user_id = user.id
 
     try:
         await update.message.chat.send_action("typing")
@@ -447,30 +273,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Не удалось обработать изображение.")
 
 
-# ================== ОТМЕНА ==================
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Действие отменено.")
-    return ConversationHandler.END
-
-
 # ================== ЗАПУСК ==================
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Обработчик диалога для запроса номера телефона
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            ASK_PHONE: [MessageHandler(filters.CONTACT, handle_contact)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(conv_handler)
-
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("pay", pay_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
