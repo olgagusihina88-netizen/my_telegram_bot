@@ -2,6 +2,8 @@ import os
 import logging
 import base64
 import re
+import json
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -25,23 +27,80 @@ if not OPENAI_API_KEY:
 
 GPT_MODEL = "gpt-4o-mini"
 
+# ================== ID АДМИНА (ВАШ ID) ==================
+ADMIN_ID = 1346576296  # ✅ Ваш ID вставлен
+
 # ================== ХРАНЕНИЕ ИСТОРИИ ДИАЛОГА ==================
-user_history = {}          # user_id -> список сообщений (роль, текст)
-MAX_HISTORY = 20            # хранить последние 20 сообщений (примерно 10 пар)
+user_history = {}
+MAX_HISTORY = 20
 
 def get_history(user_id: int):
-    """Возвращает историю пользователя (список словарей с ролью и содержимым)"""
     return user_history.get(user_id, [])
 
 def add_to_history(user_id: int, role: str, content: str):
-    """Добавляет сообщение в историю и обрезает её до MAX_HISTORY"""
     if user_id not in user_history:
         user_history[user_id] = []
     user_history[user_id].append({"role": role, "content": content})
     if len(user_history[user_id]) > MAX_HISTORY:
         user_history[user_id] = user_history[user_id][-MAX_HISTORY:]
 
-# ================== ПРОМПТ С ИНСТРУКЦИЕЙ ОБУЧЕНИЯ ==================
+# ================== СТАТИСТИКА ==================
+STATS_FILE = "bot_stats.json"
+
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {
+        "users": {},
+        "total_messages": 0,
+        "total_users": 0,
+    }
+
+def save_stats(stats):
+    with open(STATS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+def update_user_stats(user_id, username, first_name):
+    stats = load_stats()
+    user_id_str = str(user_id)
+    now = datetime.now().isoformat()
+    
+    if user_id_str not in stats["users"]:
+        stats["users"][user_id_str] = {
+            "username": username,
+            "first_name": first_name,
+            "first_seen": now,
+            "messages_count": 0,
+            "last_seen": now
+        }
+        stats["total_users"] = len(stats["users"])
+    else:
+        stats["users"][user_id_str]["last_seen"] = now
+        stats["users"][user_id_str]["messages_count"] += 1
+    
+    stats["total_messages"] += 1
+    save_stats(stats)
+
+def get_user_stats():
+    stats = load_stats()
+    users = stats["users"]
+    now = datetime.now()
+    today = now.date().isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+    
+    active_today = sum(1 for u in users.values() if u["last_seen"].startswith(today))
+    active_week = sum(1 for u in users.values() if u["last_seen"] > week_ago)
+    
+    return {
+        "total_users": stats["total_users"],
+        "total_messages": stats["total_messages"],
+        "active_today": active_today,
+        "active_week": active_week,
+        "users": users
+    }
+
+# ================== ПРОМПТ ==================
 
 SYSTEM_PROMPT = """
 Ты школьный помощник 1–9 классов. Твоя цель — научить ученика решать задачи, а не просто дать ответ.
@@ -86,7 +145,6 @@ client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # ================== ФУНКЦИЯ ДЛЯ ОЧИСТКИ ОТ LaTeX ==================
 
 def clean_latex(text: str) -> str:
-    """Удаляет LaTeX-скобки \(...\) и заменяет \cdot на ×."""
     text = re.sub(r'\\\(|\\\)', '', text)
     text = text.replace(r'\cdot', '×')
     return text
@@ -95,25 +153,59 @@ def clean_latex(text: str) -> str:
 # ================== START ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    # Сбрасываем историю при новом старте
+    user = update.effective_user
+    update_user_stats(user.id, user.username, user.first_name)
+    
+    user_id = user.id
     if user_id in user_history:
         del user_history[user_id]
+    
     await update.message.reply_text(
         "Привет! 👋 Я помогу тебе разобраться с задачами. Просто отправь мне пример или фото задания, и мы вместе его решим."
     )
 
 
+# ================== КОМАНДА СТАТИСТИКИ (ТОЛЬКО ДЛЯ АДМИНА) ==================
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет доступа к этой команде.")
+        return
+    
+    stats = get_user_stats()
+    
+    msg = (
+        f"📊 **Статистика бота**\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"💬 Всего сообщений: {stats['total_messages']}\n"
+        f"📅 Активных сегодня: {stats['active_today']}\n"
+        f"📆 Активных за неделю: {stats['active_week']}\n\n"
+        f"**Топ-5 активных пользователей:**\n"
+    )
+    
+    top_users = sorted(
+        stats["users"].items(),
+        key=lambda x: x[1]["messages_count"],
+        reverse=True
+    )[:5]
+    
+    for user_id_str, data in top_users:
+        name = data["first_name"] or data["username"] or "Unknown"
+        msg += f"• {name}: {data['messages_count']} сообщ.\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # ================== ОБРАБОТКА ТЕКСТА ==================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    update_user_stats(user.id, user.username, user.first_name)
+    
+    user_id = user.id
     user_message = update.message.text
-
-    # Получаем историю пользователя
     history = get_history(user_id)
-
-    # Формируем список сообщений для OpenAI: системный промпт + история + текущее сообщение
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_message}]
 
     try:
@@ -122,11 +214,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=messages,
             max_tokens=1500,
         )
-
         answer = response.choices[0].message.content
         answer = clean_latex(answer)
 
-        # Добавляем текущий вопрос и ответ в историю
         add_to_history(user_id, "user", user_message)
         add_to_history(user_id, "assistant", answer)
 
@@ -140,22 +230,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== ОБРАБОТКА ФОТО ==================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    update_user_stats(user.id, user.username, user.first_name)
+    
+    user_id = user.id
 
     try:
         await update.message.chat.send_action("typing")
-
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
-
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
         user_message = update.message.caption or "Объясни задачу на фото."
 
-        # Получаем историю
         history = get_history(user_id)
-
-        # Для фото историю учитываем, но само изображение не храним в истории
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [
             {
                 "role": "user",
@@ -163,9 +251,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     {"type": "text", "text": user_message},
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        },
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
                     },
                 ],
             }
@@ -176,11 +262,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=messages,
             max_tokens=1500,
         )
-
         answer = response.choices[0].message.content
         answer = clean_latex(answer)
 
-        # Сохраняем в историю текстовую часть (вопрос и ответ)
         add_to_history(user_id, "user", user_message)
         add_to_history(user_id, "assistant", answer)
 
@@ -197,6 +281,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
